@@ -119,13 +119,6 @@ const std::vector<token_range_description>& topology_description::entries() cons
     return _entries;
 }
 
-static stream_id make_random_stream_id() {
-    static thread_local std::mt19937_64 rand_gen(std::random_device().operator()());
-    static thread_local std::uniform_int_distribution<int64_t> rand_dist(std::numeric_limits<int64_t>::min());
-
-    return {rand_dist(rand_gen), rand_dist(rand_gen)};
-}
-
 /* Given:
  * 1. a set of tokens which split the token ring into token ranges (vnodes),
  * 2. information on how each token range is distributed among its owning node's shards
@@ -154,8 +147,9 @@ topology_description generate_topology_description(
     tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
 
     std::vector<token_range_description> entries(tokens.size());
-    int spots_to_fill = 0;
 
+    assert(tokens.size() > 1);
+    auto prev_token = tokens.back();
     for (size_t i = 0; i < tokens.size(); ++i) {
         auto& entry = entries[i];
         entry.token_range_end = tokens[i];
@@ -173,118 +167,34 @@ topology_description generate_topology_description(
             entry.sharding_ignore_msb = get_sharding_ignore_msb(*endpoint, gossiper);
         }
 
-        spots_to_fill += entry.streams.size();
-    }
-
-    auto schema = schema_builder("fake_ks", "fake_table")
-        .with_column("stream_id", bytes_type, column_kind::partition_key)
-        .build();
-
-    auto quota = std::chrono::seconds(spots_to_fill / 2000 + 1);
-    auto start_time = std::chrono::system_clock::now();
-
-    // For each pair (i, j), 0 <= i < streams.size(), 0 <= j < streams[i].size(),
-    // try to find a stream (stream[i][j]) such that the token of this stream will get mapped to this stream
-    // (refer to the comments above topology_description's definition to understand how it describes the mapping).
-    // We find the streams by randomly generating them and checking into which pairs they get mapped.
-    // NOTE: this algorithm is temporary and will be replaced after per-table-partitioner feature gets merged in.
-    repeat([&] {
-        for (int i = 0; i < 500; ++i) {
-            auto stream_id = make_random_stream_id();
-            auto token = dht::get_token(*schema, stream_id.to_partition_key(*schema));
-
-            // Find the token range into which our stream_id's token landed.
-            auto it = std::lower_bound(tokens.begin(), tokens.end(), token);
-            auto& entry = entries[it != tokens.end() ? std::distance(tokens.begin(), it) : 0];
-
-            auto shard_id = dht::shard_of(entry.streams.size(), entry.sharding_ignore_msb, token);
-            assert(shard_id < entry.streams.size());
-
-            if (!entry.streams[shard_id].is_set()) {
-                --spots_to_fill;
-                entry.streams[shard_id] = stream_id;
-            }
-        }
-
-        if (!spots_to_fill) {
-            return stop_iteration::yes;
-        }
-
-        auto now = std::chrono::system_clock::now();
-        auto passed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
-        if (passed > quota) {
-            return stop_iteration::yes;
-        }
-
-        return stop_iteration::no;
-    }).get();
-
-    if (spots_to_fill) {
-        // We were not able to generate stream ids for each (token range, shard) pair.
-
-        // For each range that has a stream, for each shard for this range that doesn't have a stream,
-        // use the stream id of the next shard for this range.
-
-        // For each range that doesn't have any stream,
-        // use streams of the first range to the left which does have a stream.
-
-        cdc_log.warn("Generation of CDC streams failed to create streams for some (vnode, shard) pair."
-                     " This can lead to worse performance.");
-
-        stream_id some_stream;
-        size_t idx = 0;
-        for (; idx < entries.size(); ++idx) {
-            for (auto s: entries[idx].streams) {
-                if (s.is_set()) {
-                    some_stream = s;
-                    break;
-                }
-            }
-            if (some_stream.is_set()) {
-                break;
-            }
-        }
-
-        assert(idx != entries.size() && some_stream.is_set());
-
-        // Iterate over all ranges in the clockwise direction, starting with the one we found a stream for.
-        for (size_t off = 0; off < entries.size(); ++off) {
-            auto& ss = entries[(idx + off) % entries.size()].streams;
-
-            int last_set_stream_idx = ss.size() - 1;
-            while (last_set_stream_idx > -1 && !ss[last_set_stream_idx].is_set()) {
-                --last_set_stream_idx;
-            }
-
-            if (last_set_stream_idx == -1) {
+        static thread_local std::mt19937_64 rand_gen(std::random_device().operator()());
+        static thread_local std::uniform_int_distribution<int64_t> rand_dist(std::numeric_limits<int64_t>::min());
+        dht::sharder sharder(entry.streams.size(), entry.sharding_ignore_msb);
+        int64_t next_token_for_unallocated_shard = dht::token::to_int64(prev_token) + 1;
+        int64_t upper_bound = dht::token::to_int64(entry.token_range_end);
+        for (size_t shard_idx = 0; shard_idx < entry.streams.size(); ++shard_idx) {
+            int64_t token;
+            auto t = sharder.token_for_next_shard(prev_token, shard_idx);
+            if (t > entry.token_range_end) {
                 cdc_log.warn(
-                        "CDC wasn't able to generate any stream for vnode ({}, {}]. We'll use another vnode's streams"
-                        " instead. This might lead to inconsistencies.",
-                        tokens[(idx + off + entries.size() - 1) % entries.size()], tokens[(idx + off) % entries.size()]);
-
-                ss[0] = some_stream;
-                last_set_stream_idx = 0;
-            }
-
-            some_stream = ss[last_set_stream_idx];
-
-            // Replace 'unset' stream ids with indexes below last_set_stream_idx
-            for (int s_idx = last_set_stream_idx - 1; s_idx > -1; --s_idx) {
-                if (ss[s_idx].is_set()) {
-                    some_stream = ss[s_idx];
+                        "CDC wasn't able to generate any stream on shard {} on vnode ({}, {}]. "
+                        "This shard will have its stream located on another shard in this vnode instead. "
+                        "This might lead to worse performance.",
+                        shard_idx, prev_token, entry.token_range_end);
+                token = next_token_for_unallocated_shard;
+                if (next_token_for_unallocated_shard == upper_bound) {
+                    next_token_for_unallocated_shard = dht::token::to_int64(prev_token) + 1;
+                } else if (next_token_for_unallocated_shard == std::numeric_limits<int64_t>::max()){
+                    next_token_for_unallocated_shard = std::numeric_limits<int64_t>::min();
                 } else {
-                    ss[s_idx] = some_stream;
+                    ++next_token_for_unallocated_shard;
                 }
+            } else {
+                token = dht::token::to_int64(t);
             }
-            // Replace 'unset' stream ids with indexes above last_set_stream_idx
-            for (int s_idx = ss.size() - 1; s_idx > last_set_stream_idx; --s_idx) {
-                if (ss[s_idx].is_set()) {
-                    some_stream = ss[s_idx];
-                } else {
-                    ss[s_idx] = some_stream;
-                }
-            }
+            entry.streams[shard_idx] = {token, rand_dist(rand_gen)};
         }
+        prev_token = entry.token_range_end;
     }
 
     return {std::move(entries)};
