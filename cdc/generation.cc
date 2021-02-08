@@ -23,6 +23,7 @@
 #include <random>
 #include <unordered_set>
 #include <seastar/core/sleep.hh>
+#include <algorithm>
 
 #include "keys.hh"
 #include "schema_builder.hh"
@@ -174,8 +175,12 @@ bool topology_description::operator==(const topology_description& o) const {
     return _entries == o._entries;
 }
 
-const std::vector<token_range_description>& topology_description::entries() const {
+const std::vector<token_range_description>& topology_description::entries() const& {
     return _entries;
+}
+
+std::vector<token_range_description>&& topology_description::entries() && {
+    return std::move(_entries);
 }
 
 class topology_description_generator final {
@@ -294,6 +299,34 @@ future<db_clock::time_point> get_local_streams_timestamp() {
     });
 }
 
+// non-static for testing
+constexpr size_t limit_of_streams_in_topology_description() {
+    // Each stream takes 16B and we don't want to exceed 4MB so we can have
+    // at most 262144 streams but not less than 1 per vnode.
+    return 4 * 1024 * 1024 / 16;
+}
+
+// non-static for testing
+topology_description limit_number_of_streams_if_needed(topology_description&& desc) {
+    int64_t streams_count = 0;
+    for (auto& tr_desc : desc.entries()) {
+        streams_count += tr_desc.streams.size();
+    }
+
+    size_t limit = std::max(limit_of_streams_in_topology_description(), desc.entries().size());
+    if (limit >= streams_count) {
+        return std::move(desc);
+    }
+    size_t vnode_limit = limit / desc.entries().size();
+    auto entries = std::move(desc).entries();
+    for (auto& e : entries) {
+        if (e.streams.size() > vnode_limit) {
+            e.streams.resize(vnode_limit);
+        }
+    }
+    return topology_description(std::move(entries));
+}
+
 // Run inside seastar::async context.
 db_clock::time_point make_new_cdc_generation(
         const db::config& cfg,
@@ -305,6 +338,18 @@ db_clock::time_point make_new_cdc_generation(
         bool add_delay) {
     using namespace std::chrono;
     auto gen = topology_description_generator(cfg, bootstrap_tokens, tmptr, g).generate();
+
+    // If the cluster is large we may end up with a generation that contains
+    // large number of streams. This is problematic because we store the
+    // generation in a single row. For a generation with large number of rows
+    // this will lead to a row that can be as big as 32MB. This is much more
+    // than the limit imposed by commitlog_segment_size_in_mb. If the size of
+    // the row that describes a new generation grows above
+    // commitlog_segment_size_in_mb, the write will fail and the new node won't
+    // be able to join. To avoid such problem we make sure that such row is
+    // always smaller than 4MB. We do that by removing some CDC streams from
+    // each vnode if the total number of streams is too large.
+    gen = limit_number_of_streams_if_needed(std::move(gen));
 
     // Begin the race.
     auto ts = db_clock::now() + (
